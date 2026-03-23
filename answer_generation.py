@@ -1,83 +1,91 @@
 from langchain_chroma import Chroma
-# from langchain_openai import OpenAIEmbeddings
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.llms import HuggingFacePipeline
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from transformers import pipeline
+from langchain_huggingface import HuggingFaceEmbeddings
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
 from dotenv import load_dotenv
-# from langchain_openai import ChatOpenAI
-# from langchain_core.messages import HumanMessage, SystemMessage
 
 load_dotenv()
 
+# ==============================
+# 1. Load Vector DB
+# ==============================
 persistent_directory = "db/chroma_db"
 
-# Load embeddings and vector store
-embedding_model = HuggingFaceEmbeddings(
-    model_name="all-MiniLM-L6-v2"
-)
+embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
 db = Chroma(
     persist_directory=persistent_directory,
     embedding_function=embedding_model,
-    collection_metadata={"hnsw:space": "cosine"}  
+    collection_metadata={"hnsw:space": "cosine"}
 )
 
-retriever = db.as_retriever(search_kwargs={"k": 5})
-
-pipe = pipeline(
-    "text-generation",
-    model="google/flan-t5-base",
-    max_new_tokens=200
+# ==============================
+# 2. Retriever
+# ==============================
+retriever = db.as_retriever(
+    search_type="similarity_score_threshold",
+    search_kwargs={"k": 3, "score_threshold": 0.3}
 )
 
-# Wrap in LangChain
-llm = HuggingFacePipeline(pipeline=pipe)
-# embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
+# ==============================
+# 3. Load FLAN-T5 directly (no pipeline task string needed)
+# ==============================
+model_name = "google/flan-t5-base"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
-prompt = ChatPromptTemplate.from_template("""
-Answer the question based ONLY on the context below.
+def generate_answer(prompt):
+    inputs = tokenizer(prompt, return_tensors="pt", max_length=512, truncation=True)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=150,
+            do_sample=False
+        )
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-""")
-
-# LCEL Chain
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
-
-rag_chain = (
-    {
-        "context": retriever | format_docs,
-        "question": RunnablePassthrough(),
-    }
-    | prompt
-    | llm
-)
-
-# Search for relevant documents
-# query = "How much did Microsoft pay to acquire GitHub?"
-query = "What was NVIDIA's first graphics accelerator called?"
-
+# ==============================
+# 4. Query
+# ==============================
+# query = "What was NVIDIA's first graphics accelerator called?"
+query = "What was Microsoft's first hardware product release?"
 print(f"\nUser Query: {query}")
 
-# retriever = db.as_retriever(
-#     search_type="similarity_score_threshold",
-#     search_kwargs={
-#         "k": 5,
-#         "score_threshold": 0.3  # Only return chunks with cosine similarity ≥ 0.3
-#     }
-# )
+# ==============================
+# 5. Retrieval + Fallback
+# ==============================
+docs = retriever.invoke(query)
 
-response = rag_chain.invoke(query)
+if not docs:
+    print("⚠️ No docs found above threshold, using fallback...")
+    retriever_fallback = db.as_retriever(search_kwargs={"k": 3})
+    docs = retriever_fallback.invoke(query)
+
+if not docs:
+    print("❌ No documents found at all. Check your vector DB.")
+    exit()
+
+# ==============================
+# 6. Build Context
+# ==============================
+context = "\n\n".join([doc.page_content for doc in docs])
+context = context[:1500]
+
+print("\n--- Retrieved Context (Debug) ---")
+print(context[:500])
+
+# ==============================
+# 7. Prompt
+# ==============================
+final_prompt = f"Context: {context}\n\nQuestion: {query}\nAnswer:"
+
+# ==============================
+# 8. Generate Answer
+# ==============================
+response = generate_answer(final_prompt)
 
 print("\n--- Generated Answer ---")
-print(response["text"] if isinstance(response, dict) else response)
+print(response if response else "⚠️ Model returned empty string")
 
 # Synthetic Questions: 
 
